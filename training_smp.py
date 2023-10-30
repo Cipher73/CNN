@@ -20,6 +20,8 @@ from catalyst.dl import CriterionCallback, MetricAggregationCallback
 from catalyst.loggers.wandb import WandbLogger
 from catalyst.utils import get_device
 
+import DANN 
+
 class SegmentationModelTrainer:
     def __init__(self, config):
         self.config = config
@@ -47,6 +49,7 @@ class SegmentationModelTrainer:
         criterion = nn.CrossEntropyLoss()
         model.to(get_device())
         model.train()
+        #metrics =[smp.utils.metrics.IoU(threshold=0.5)]
         
         for epoch in range(self.config['num_epochs']):
             for phase in ['train', 'valid']:
@@ -64,6 +67,7 @@ class SegmentationModelTrainer:
                     optimizer.zero_grad()
 
                     with torch.set_grad_enabled(phase == 'train'):
+                        inputs = self.config['feature_extractor'](inputs) # domain daptation model
                         outputs = model(inputs.float())
                         loss = criterion(outputs, targets)
                         iou = compute_iou(outputs, targets)
@@ -174,7 +178,7 @@ class SegmentationModelTrainer:
         return accuracy
 
 
-# Define a function to compute IoU
+#function to compute IoU
 def compute_iou(outputs, targets):
     intersection = (outputs.argmax(dim=1) & targets).float().sum((1, 2))
     union = (outputs.argmax(dim=1) | targets).float().sum((1, 2))
@@ -225,6 +229,7 @@ class DataProcessor:
         X_val = val_images.transpose(0, 3, 1, 2)      # Transpose image dimensions
         y_val = val_masks
         n_classes = len(np.unique(y_train))
+        print(f"Number of classes = {n_classes}")
         y_train_cat = torch.tensor(y_train, dtype=torch.long)
         y_test_cat = torch.tensor(y_test, dtype=torch.long)
         y_val_cat = torch.tensor(y_val, dtype=torch.long)
@@ -232,59 +237,84 @@ class DataProcessor:
         #X_train = X_train.astype(np.float64)
         return X_train, y_train_cat, X_test, y_test_cat, X_val, y_val_cat, n_classes
 
-def main():
-    data_processor = DataProcessor()
 
-    # Load and preprocess data
-    train_images = np.array(data_processor.get_data("Dataset/train/noisy_images/", 1))
-    train_masks = np.array(data_processor.get_data("Dataset/train/noisy_masks/", 0))
-    val_images = np.array(data_processor.get_data("Dataset/val/noisy_images/", 1))
-    val_masks = np.array(data_processor.get_data("Dataset/val/noisy_masks/", 0))
-    test_images = np.array(data_processor.get_data("Dataset/test/noisy_images/", 1))
-    test_masks = np.array(data_processor.get_data("Dataset/test/noisy_masks/", 0))
 
-    # Shuffle the data
-    train_images, train_masks = data_processor.shuffle_data(train_images, train_masks)
-    val_images, val_masks = data_processor.shuffle_data(val_images, val_masks)
-    test_images, test_masks = data_processor.shuffle_data(test_images, test_masks)
+feature_extractor = DANN.FeatureExtractor()
+classifier = DANN.Classifier()
+domain_classifier = DANN.DomainClassifier()
+optimizer_f = optim.Adam(feature_extractor.parameters())
+optimizer_c = optim.Adam(classifier.parameters())
+optimizer_d = optim.Adam(domain_classifier.parameters())
 
-    # Preprocess the data
-    X_train, y_train_cat, X_test, y_test_cat, X_val, y_val_cat, n_classes = data_processor.preprocess_data(
-        train_images, train_masks, val_images, val_masks, test_images, test_masks
-    )
+# Load the saved model checkpoint
+checkpoint = torch.load('domain_adaptation_model.pth')
 
-    # Define configuration parameters
-    learning_rate = 0.001
-    config = {
-        'wandb_project': "SSOCTLRE",
-        'num_epochs': 10,
-        'batch_size': 16,
-        'achitecture': ['Unet', 'DeepLabV3Plus'],
-        'encoders': ['resnet34', 'resnet50'],
-        'n_classes': n_classes,
-        'activation': 'softmax',
-        'learning_rate': learning_rate,
-        'optimizer': "adam"
-    }
+# Load the state dicts into the corresponding models and optimizers
+feature_extractor.load_state_dict(checkpoint['feature_extractor_state_dict'])
+classifier.load_state_dict(checkpoint['classifier_state_dict'])
+domain_classifier.load_state_dict(checkpoint['domain_classifier_state_dict'])
+optimizer_f.load_state_dict(checkpoint['optimizer_f_state_dict'])
+optimizer_c.load_state_dict(checkpoint['optimizer_c_state_dict'])
+optimizer_d.load_state_dict(checkpoint['optimizer_d_state_dict'])
 
-    # Initialize and use the SegmentationModelTrainer class
-    trainer = SegmentationModelTrainer(config)
-    dataloaders = {
-        "train": DataLoader(list(zip(X_train, y_train_cat)), batch_size=config['batch_size'], shuffle=True),
-        "valid": DataLoader(list(zip(X_val, y_val_cat)), batch_size=config['batch_size'], shuffle=False),
-        "test": DataLoader(list(zip(X_test, y_test_cat)), batch_size=config['batch_size'], shuffle=False)
-    }
-    #trainer.train_segmentation_models(dataloaders)
+    
+data_processor = DataProcessor()
 
-    # Evaluate trained models on test data
-    for model_name in trainer.models:
-        #load model
-        arch, encoder = model_name.split('_')
-        model = trainer.build_segmentation_model(arch, encoder, config['n_classes'], config['activation'])
-        model.load_state_dict(torch.load(f"saved_models/{model_name}_model_WN_smp.pth"))
-        
-        accuracy = trainer.evaluate_models_on_test(model,dataloaders, model_name)
-        print(f"{model_name} Test Accuracy: {accuracy}")
+# Load and preprocess data
+train_images = np.array(data_processor.get_data("Dataset/train/noisy_images/", 1))
+train_masks = np.array(data_processor.get_data("Dataset/train/noisy_masks/", 0))
+val_images = np.array(data_processor.get_data("Dataset/val/noisy_images/", 1))
+val_masks = np.array(data_processor.get_data("Dataset/val/noisy_masks/", 0))
+test_images = np.array(data_processor.get_data("Dataset/test/noisy_images/", 1))
+test_masks = np.array(data_processor.get_data("Dataset/test/noisy_masks/", 0))
 
-if __name__ == "__main__":
-    main()
+# Shuffle the data
+train_images, train_masks = data_processor.shuffle_data(train_images, train_masks)
+val_images, val_masks = data_processor.shuffle_data(val_images, val_masks)
+test_images, test_masks = data_processor.shuffle_data(test_images, test_masks)
+
+# Preprocess the data
+X_train, y_train_cat, X_test, y_test_cat, X_val, y_val_cat, n_classes = data_processor.preprocess_data(
+    train_images, train_masks, val_images, val_masks, test_images, test_masks
+)
+
+config = {
+    'wandb_project': "SSOCTLRE",
+    'num_epochs': 1,
+    'batch_size': 16,
+    'achitecture': ['Unet', 'DeepLabV3Plus'],
+    'encoders': ['resnet34', 'resnet50'],
+    'n_classes': n_classes,
+    'activation': 'softmax',
+    'learning_rate': 0.001,
+    'optimizer': "adam"
+}
+
+# Add the new parameters
+config['feature_extractor'] = feature_extractor
+config['classifier'] = classifier
+config['domain_classifier'] = domain_classifier
+config['optimizer_f'] = optimizer_f
+config['optimizer_c'] = optimizer_c
+config['optimizer_d'] = optimizer_d
+
+
+# Initialize and use the SegmentationModelTrainer class
+trainer = SegmentationModelTrainer(config)
+dataloaders = {
+    "train": DataLoader(list(zip(X_train, y_train_cat)), batch_size=config['batch_size'], shuffle=True),
+    "valid": DataLoader(list(zip(X_val, y_val_cat)), batch_size=config['batch_size'], shuffle=False),
+    "test": DataLoader(list(zip(X_test, y_test_cat)), batch_size=config['batch_size'], shuffle=False)
+}
+trainer.train_segmentation_models(dataloaders)
+
+# Evaluate trained models on test data
+for model_name in trainer.models:
+    #load model
+    arch, encoder = model_name.split('_')
+    model = trainer.build_segmentation_model(arch, encoder, config['n_classes'], config['activation'])
+    model.load_state_dict(torch.load(f"saved_models/{model_name}_model_WN_smp.pth"))
+    
+    accuracy = trainer.evaluate_models_on_test(model,dataloaders, model_name)
+    print(f"{model_name} Test Accuracy: {accuracy}")
+

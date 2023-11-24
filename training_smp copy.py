@@ -19,10 +19,6 @@ from catalyst.dl import SupervisedRunner
 from catalyst.dl import CriterionCallback, MetricAggregationCallback
 from catalyst.loggers.wandb import WandbLogger
 from catalyst.utils import get_device
-import matplotlib.patches as mpatches
-import torch.nn.functional as F
-
-
 
 class SegmentationModelTrainer:
     def __init__(self, config):
@@ -49,7 +45,6 @@ class SegmentationModelTrainer:
     def train_model(self, model, dataloaders):
         optimizer = optim.Adam(model.parameters(), lr=self.config['learning_rate'])
         criterion = nn.CrossEntropyLoss()
-        target_criterion = nn.CrossEntropyLoss()
         model.to(get_device())
         model.train()
         #metrics =[smp.utils.metrics.IoU(threshold=0.5)]
@@ -63,18 +58,14 @@ class SegmentationModelTrainer:
 
                 running_loss = 0.0
                 running_iou = 0.0
-                target_running_loss = 0.0
-                source_dataloader = dataloaders['train']
-                target_domain_dataloader = dataloaders['target_train']
-                 
 
-                for batch_idx, ((source_inputs, source_targets), (target_inputs, target_targets)) in enumerate(zip(source_dataloader, target_domain_dataloader)):
-                    inputs, targets = source_inputs.to(get_device()), source_targets.to(get_device())
-                    target_inputs = target_inputs.to(get_device())
+                for inputs, targets in dataloaders[phase]:
+                    inputs, targets = inputs.to(get_device()), targets.to(get_device())
 
                     optimizer.zero_grad()
 
                     with torch.set_grad_enabled(phase == 'train'):
+                        inputs = self.config['feature_extractor'](inputs) # domain daptation model
                         outputs = model(inputs.float())
                         loss = criterion(outputs, targets)
                         iou = compute_iou(outputs, targets)
@@ -82,24 +73,17 @@ class SegmentationModelTrainer:
                         if phase == 'train':
                             loss.backward()
                             optimizer.step()
-                    target_outputs = model(target_inputs.float())
-                    target_loss = target_criterion(target_outputs, F.softmax(target_outputs, dim=1).argmax(dim=1))
-                    
+
                     running_loss += loss.item() * inputs.size(0)
                     running_iou += iou.item() * inputs.size(0)
-                    target_running_loss+= target_loss.item() * target_inputs.size(0)
 
                 epoch_loss = running_loss / len(dataloaders[phase].dataset)
                 epoch_iou = running_iou / len(dataloaders[phase].dataset)
-                target_epoch_loss = target_running_loss / len(target_domain_dataloader.dataset)
-                
 
                 print(f'{phase} Loss: {epoch_loss:.4f}, IoU: {epoch_iou:.4f}')
-                print(f'{phase} Target Loss: {target_epoch_loss:.4f}')
 
                 # Log metrics to wandb for each epoch
                 wandb.log({f'{phase}_loss': epoch_loss, f'{phase}_iou': epoch_iou})
-                wandb.log({f'{phase}_target_loss': target_epoch_loss})
 
         return model
 
@@ -118,7 +102,7 @@ class SegmentationModelTrainer:
                 with wandb.init(
                     project=self.config['wandb_project'],
                     config=self.config,
-                    name=f"{achitecture}_{encoder}"
+                    name=f"smp_{achitecture}_{encoder}_BS_{self.config['batch_size']}_LR_{self.config['learning_rate']}_WOD_WN"
                 ):
                     self.train_single_model(dataloaders, achitecture, encoder)
 
@@ -163,38 +147,26 @@ class SegmentationModelTrainer:
         wandb.init(
             project=self.config['wandb_project'],
             config=self.config,
-            name=f"accuracy_{model_name}"
+            name=f"smp_accuracy_{model_name}_BS_{self.config['batch_size']}_LR_{self.config['learning_rate']}_WOD_WN"
         )
 
 
-        class_colors = [[0, 0, 0], [0, 0, 255], [0, 255, 0], [255, 0, 0], [255, 255, 0], [255, 0, 255], [0, 255, 255], [255, 255, 255], [0, 0, 0], [128, 128, 128]]
-        class_names = ['background', 'NFL', 'GCL-IPL', 'INL', 'OPL', 'ONL-ISM', 'ISM', 'OS-RPE', 'background', 'Fluid']
-
+        # Loop through some test images for visualization and logging
         for i in range(min(3, len(X_test))):
-            prediction = y_pred_argmax[i]
-            colored_mask = np.zeros((*prediction.shape, 3), dtype=np.uint8)
-            for class_id, color in enumerate(class_colors):
-                colored_mask[prediction == class_id] = color
-            
-            # do the same for the ground truth mask
-            ground_truth = y_test_argmax[i]
-            colored_ground_truth = np.zeros((*ground_truth.shape, 3), dtype=np.uint8)
-            for class_id, color in enumerate(class_colors):
-                colored_ground_truth[ground_truth == class_id] = color
-                
+            # Clean up: Delete the temporary images if they are no longer needed
+            # Save image ground truth and prediction on the same image
+            plt.subplot(2,3,1)
+            plt.imshow(X_test[i].transpose(1, 2, 0))
             plt.title('Image')
-            plt.subplot(2, 3, 1)
-            plt.imshow(colored_ground_truth)
+            plt.subplot(2,3,2)
+            plt.imshow(y_test_argmax[i])
             plt.title('Ground Truth')
-            plt.subplot(2, 3, 2)
-            plt.imshow(colored_mask)
+            plt.subplot(2,3,3)
+            plt.imshow(y_pred_argmax[i])
             plt.title('Prediction')
-             # Create legend excluding classes with class_id 0 and 8
-            legend_patches = [mpatches.Patch(color=np.array(color) / 255, label=class_names[class_id]) for class_id, color in enumerate(class_colors) if class_id not in [0, 8]]
-            plt.legend(handles=legend_patches, bbox_to_anchor=(1.05, 1), loc='upper left', borderaxespad=0.)
-            plt.savefig(f"plots/{model_name}_prediction_{i}.png")
+            plt.savefig(f"plots/{model_name}_prediction_{i}_WN_smp.png")
             plt.close()
-            wandb.log({f"{model_name}_prediction_{i}": wandb.Image(f"plots/{model_name}_prediction_{i}.png")})
+            wandb.log({f"smp_{model_name}_prediction_{i}": wandb.Image(f"plots/{model_name}_prediction_{i}_WN_smp.png")})
             
         # Calculate accuracy
         accuracy = accuracy_score(y_test_argmax.flatten(), y_pred_argmax.flatten())
@@ -212,11 +184,21 @@ def compute_iou(outputs, targets):
     return iou.mean()
 
 
+# DATA PROCESSING FUNCTIONS
 class DataProcessor:
+    
     @staticmethod
     def get_data(directory_path, flag):
         images = []
         for img_path in glob.glob(os.path.join(directory_path, "*.tif")):
+            img = cv2.imread(img_path, flag)
+            images.append(img)
+        images = np.array(images)
+        return images
+    @staticmethod
+    def get_images_from_path_list(path_list, flag):
+        images = []
+        for img_path in path_list:
             img = cv2.imread(img_path, flag)
             images.append(img)
         images = np.array(images)
@@ -254,7 +236,7 @@ class DataProcessor:
         y_test = test_masks
         X_val = val_images.transpose(0, 3, 1, 2)      # Transpose image dimensions
         y_val = val_masks
-        n_classes = len(np.unique(y_train))
+        n_classes = len(np.unique(y_test))
         print(f"Number of classes = {n_classes}")
         y_train_cat = torch.tensor(y_train, dtype=torch.long)
         y_test_cat = torch.tensor(y_test, dtype=torch.long)
@@ -263,48 +245,50 @@ class DataProcessor:
         #X_train = X_train.astype(np.float64)
         return X_train, y_train_cat, X_test, y_test_cat, X_val, y_val_cat, n_classes
 
- 
 
-    
+
+
+#GET DATA
 data_processor = DataProcessor()
 
-# Load and preprocess data
-train_images = np.array(data_processor.get_data("Dataset/train/images/", 1))
+source_domain_train_images = np.array(data_processor.get_data("Dataset/train/images/", 1))
+source_domain_train_masks = np.array(data_processor.get_data("Dataset/train/masks/", 0))
+
+source_domain_val_images = np.array(data_processor.get_data("Dataset/val/images/", 1))
+source_domain_val_masks = np.array(data_processor.get_data("Dataset/val/masks/", 0))
+source_domain_test_images = np.array(data_processor.get_data("Dataset/test/images/", 1))
+source_domain_test_masks = np.array(data_processor.get_data("Dataset/test/masks/", 0))
+
 target_domain_train_images = np.array(data_processor.get_data("Dataset/train/noisy_images/", 1))
-train_masks = np.array(data_processor.get_data("Dataset/train/masks/", 0))
-val_images = np.array(data_processor.get_data("Dataset/val/images/", 1))
-val_masks = np.array(data_processor.get_data("Dataset/val/masks/", 0))
-test_images = np.array(data_processor.get_data("Dataset/test/images/", 1))
-test_domain_images = np.array(data_processor.get_data("Dataset/test/noisy_images/", 1))
-test_masks = np.array(data_processor.get_data("Dataset/test/masks/", 0))
-test_domain_masks = np.array(data_processor.get_data("Dataset/test/noisy_masks/", 0))
-# Shuffle the data
-train_images, train_masks = data_processor.shuffle_data(train_images, train_masks)
-val_images, val_masks = data_processor.shuffle_data(val_images, val_masks)
-test_images, test_masks = data_processor.shuffle_data(test_images, test_masks)
- 
-#target domain data
-target_domain_train_images, target_domain_train_image2 = data_processor.shuffle_data(target_domain_train_images, target_domain_train_images)
-test_domain_images, test_domain_masks = data_processor.shuffle_data(test_domain_images, test_domain_masks)
+target_domain_train_masks = np.array(data_processor.get_data("Dataset/train/noisy_masks/", 0))
+target_domain_val_images = np.array(data_processor.get_data("Dataset/val/noisy_images/", 1))
+target_domain_val_masks = np.array(data_processor.get_data("Dataset/val/noisy_masks/", 0))
+target_domain_test_images = np.array(data_processor.get_data("Dataset/test/noisy_images/", 1))
+target_domain_test_masks = np.array(data_processor.get_data("Dataset/test/noisy_masks/", 0))
 
-# concatianate test sets 
-test_images = np.concatenate((test_images, test_domain_images), axis=0)
-test_masks = np.concatenate((test_masks, test_domain_masks), axis=0)
+X_source_train, y_source_train, X_source_val, y_source_val, X_source_test, y_source_test, n_classes = data_processor.preprocess_data(source_domain_train_images, source_domain_train_masks, source_domain_val_images, source_domain_val_masks, source_domain_test_images, source_domain_test_masks)
+X_target_train, y_target_train, X_target_val, y_target_val, X_target_test, y_target_test, _ = data_processor.preprocess_data(target_domain_train_images, target_domain_train_masks, target_domain_val_images, target_domain_val_masks, target_domain_test_images, target_domain_test_masks)
+#DATA LOADERS
+source_dataloader = DataLoader(list(zip(X_source_train, y_source_train)), batch_size=32, shuffle=True)
+source_val_dataloader = DataLoader(list(zip(X_source_val, y_source_val)), batch_size=32, shuffle=False)
+source_test_dataloader = DataLoader(list(zip(X_source_test, y_source_test)), batch_size=32, shuffle=False)
 
+target_dataloader = DataLoader(list(zip(X_target_train, y_target_train)), batch_size=32, shuffle=True)
+target_val_dataloader = DataLoader(list(zip(X_target_val, y_target_val)), batch_size=32, shuffle=False)
+target_test_dataloader = DataLoader(list(zip(X_target_test, y_target_test)), batch_size=32, shuffle=False)
+combined_test_dataset = np.concatenate((X_source_test, X_target_test), axis=0)
+combined_test_y = np.concatenate((y_source_test, y_target_test), axis=0)
+combined_test_dataloader = DataLoader(list(zip(combined_test_dataset, combined_test_y)), batch_size=32, shuffle=True)
 
-# Preprocess the data
-X_train, y_train_cat, X_test, y_test_cat, X_val, y_val_cat, n_classes = data_processor.preprocess_data(
-    train_images, train_masks, val_images, val_masks, test_images, test_masks
-)
-
-X_target_train, y_target_train_cat, X_target_test, y_target_test_cat, X_target_val, y_target_val_cat, n_classes = data_processor.preprocess_data(
-    target_domain_train_images, train_masks, val_images, val_masks, test_domain_images, test_domain_masks)
-
+print("Data loaded")
+print("Source data size: ", len(source_dataloader))
+print("Target data size: ", len(target_dataloader))
+print("sized of combined test dataloader: ", len(combined_test_dataloader))
 
 config = {
     'wandb_project': "SSOCTLRE",
-    'num_epochs': 10,
-    'batch_size': 2,
+    'num_epochs': 1,
+    'batch_size': 16,
     'achitecture': ['Unet', 'DeepLabV3Plus'],
     'encoders': ['resnet34', 'resnet50'],
     'n_classes': n_classes,
@@ -314,16 +298,13 @@ config = {
 }
 
 
-
 # Initialize and use the SegmentationModelTrainer class
 trainer = SegmentationModelTrainer(config)
 dataloaders = {
-    "train": DataLoader(list(zip(X_train, y_train_cat)), batch_size=config['batch_size'], shuffle=True),
-    "target_train": DataLoader(list(zip(X_target_train, y_target_train_cat)), batch_size=config['batch_size'], shuffle=True),
-    "valid": DataLoader(list(zip(X_val, y_val_cat)), batch_size=config['batch_size'], shuffle=False),
-    "test": DataLoader(list(zip(X_test, y_test_cat)), batch_size=config['batch_size'], shuffle=False)
-}
-#trainer.train_segmentation_models(dataloaders)
+    "train": source_dataloader,
+    "val":source_val_dataloader,
+    "test":source_test_dataloader}
+trainer.train_segmentation_models(dataloaders)
 
 # Evaluate trained models on test data
 for model_name in trainer.models:

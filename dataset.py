@@ -163,17 +163,13 @@ noise_types = [
     {
         'name': 'signal_attenuation',
         'noise_generator': SignalAttenuation()
-    },
-    {
-        'name': 'noop',
-        'noise_generator': NoopTransform()
     }
 ]
 
 # Noise percentages for training, validation, and test datasets
-noise_percentages_train = [0.25, 0.15, 0.25, 0.1, 0.1, 0.05, 0.1]
-noise_percentages_val = [0.2, 0.15, 0.3, 0.15, 0.1, 0.05, 0.05]
-noise_percentages_test = [0.15, 0.15, 0.4, 0.15, 0.05, 0.05, 0.05]
+noise_percentages_train = [0.25, 0.15, 0.25, 0.1, 0.1, 0.15]
+noise_percentages_val = [0.2, 0.15, 0.3, 0.15, 0.1, 0.1]
+noise_percentages_test = [0.15, 0.15, 0.4, 0.15, 0.05, 0.1]
 
 # Function to shuffle a list of images
 def shuffle_data(images):
@@ -209,26 +205,17 @@ class CustomDataset(Dataset):
         self.transform = transform
         self.noise_percentages=noise_percentages
         self.noise_generator_img_indxs = []
+        self.available_images = []
         
 
-    def apply_noise_based_on_percentage(self, noise_percentages):
-        total_images = len(self.image_paths)
-        already_selected = set()
-
-        for idx, noise_percentage in enumerate(noise_percentages):
-            num_images_for_noise = int(total_images * noise_percentage)
-
-            # Randomly select images that haven't been selected before
-            selected_images = random.sample([i for i in range(total_images) if i not in already_selected], num_images_for_noise)
-            already_selected.update(selected_images)
-
-            # Save the indices for the current noise generator
-            self.noise_generator_img_indxs.append(selected_images)
-
-        # Reset the already_selected set for future use
-        already_selected.clear()
-
-
+    def apply_noise_to_all_images(self, noise_generator):
+            while self.available_images:
+                # Randomly select an image from the available images
+                selected_image = random.choice(self.available_images)
+                self.noise_generator_img_indxs.append([selected_image])
+                
+                # Remove the selected image from the available images
+                self.available_images.remove(selected_image)
     def __len__(self):
         return len(self.image_paths)
 
@@ -248,38 +235,55 @@ class CustomDataset(Dataset):
         return image, mask
 
 
+
     def process_fake_noise_image(self, work_id, worker_num):
-        self.apply_noise_based_on_percentage(self.noise_percentages)
-        for noise_idx, noise_generator_indices in enumerate(self.noise_generator_img_indxs):
-            noise_generator = noise_types[noise_idx]['noise_generator']
-            noise_name = noise_types[noise_idx]['name']
+        noise_generators = [noise_types[i]['noise_generator'] for i in range(len(noise_types))]
+        self.available_images = list(range(len(self.image_paths)))
+        print("len of available images",len(self.available_images))
 
-            # Process only a subset of images based on work_id and worker_num
-            for idx in range(work_id, len(noise_generator_indices), worker_num):
-                image_idx = noise_generator_indices[idx]
-                image_path = os.path.join(self.image_dir, self.image_paths[image_idx])
-                mask_path = os.path.join(self.mask_dir, self.image_paths[image_idx])
+        # Continue processing until all images have been used
+        while self.available_images:
+            # Loop through each noise generator
+            for noise_generator in noise_generators:
+                # Break the loop if there are no more available images
+                if not self.available_images:
+                    break
 
-                # Load the clean image and mask
-                clean = Image.open(image_path)
-                mask = Image.open(mask_path)
+                # Select one image at random from available images
+                image_idx =self.available_images.pop()
+                #self.available_images.remove(image_idx)  # Remove the selected image from the pool of available images
 
-                # Apply transformations to the clean image
-                if self.transform:
-                    state = torch.get_rng_state()
-                    clean = self.transform(clean)
-                    torch.set_rng_state(state)
+                # Process the image if it matches the current worker's responsibility
+                if image_idx % worker_num == work_id:
+                    image_path = os.path.join(self.image_dir, self.image_paths[image_idx])
+                    mask_path = os.path.join(self.mask_dir, self.image_paths[image_idx])
 
-                # Generate fake noisy image from the clean image
-                fake_noisy = noise_generator(clean)
+                    # Load the clean image and mask
+                    clean = Image.open(image_path).convert('RGB')
+                    mask = Image.open(mask_path).convert('RGB')
 
-                # Save the generated data
-                filename = noise_name + "_" + self.image_paths[image_idx]
-                fake_noisy = transforms.ToPILImage()(fake_noisy)
-                clean= transforms.ToPILImage()(clean)
-                fake_noisy.save(os.path.join(self.root_dir, self.data_type, 'noisy_images', filename))  # Save the image
-                clean.save(os.path.join(self.root_dir, self.data_type, 'clean_images', filename))  # Save the image
-                mask.save(os.path.join(self.root_dir, self.data_type, 'noisy_masks', filename))  # Save the mask
+                    # Apply transformations to the clean image if required
+                    if hasattr(self, 'transform') and self.transform is not None:
+                        state = torch.get_rng_state()
+                        clean = self.transform(clean)
+                        torch.set_rng_state(state)
+
+                    # Generate fake noisy image from the clean image
+                    fake_noisy = noise_generator(clean)
+
+                    # Save the generated data
+                    noise_name = noise_types[noise_generators.index(noise_generator)]['name']
+                    filename = f"{noise_name}_{self.image_paths[image_idx]}"
+
+                    # Convert tensors to PIL images if necessary
+                    if isinstance(fake_noisy, torch.Tensor):
+                        fake_noisy = transforms.ToPILImage()(fake_noisy)
+                        clean = transforms.ToPILImage()(clean)
+
+                    # Save the images and mask
+                    fake_noisy.save(os.path.join(self.root_dir, self.data_type, 'noisy_images', filename))
+                    #clean.save(os.path.join(self.root_dir, self.data_type, 'clean_images', filename))
+                    mask.save(os.path.join(self.root_dir, self.data_type, 'noisy_masks', filename))
 
         """ process.set_description(f'Worker {work_id} Finished Job')
         process.close()"""
@@ -288,9 +292,9 @@ class CustomDataset(Dataset):
         print(f'Start Processing with {workers} workers')
         noisy_crops_dir = os.path.join(self.root_dir, self.data_type, 'noisy_images')
         masks_dir= os.path.join(self.root_dir, self.data_type, 'noisy_masks')
-        clean_dir= os.path.join(self.root_dir, self.data_type, 'clean_images')
+        """        clean_dir= os.path.join(self.root_dir, self.data_type, 'clean_images')
         if not os.path.exists(clean_dir):
-            os.makedirs(clean_dir)
+            os.makedirs(clean_dir)"""
             
         if not os.path.exists(masks_dir):
             os.makedirs(masks_dir)
@@ -298,6 +302,7 @@ class CustomDataset(Dataset):
             os.makedirs(noisy_crops_dir)
         process_pool = []
         for i in range(workers):
+
             proc = mp.Process(target=self.process_fake_noise_image, args=(i, workers,))
             process_pool.append(proc)
             proc.start()
@@ -325,13 +330,13 @@ if __name__ == '__main__':
         noise_generator = noise_type['noise_generator']
         noise_name = noise_type['name']
 
-        train_dataset = CustomDataset(root_dir=args.root, data_type='train', transform=transform, load_fake=False, noise_generator=noise_generator, noise_name=noise_name,noise_percentages=noise_percentages_train)
-        val_dataset = CustomDataset(root_dir=args.root, data_type='val', transform=transform, load_fake=False, noise_generator=noise_generator, noise_name=noise_name,noise_percentages=noise_percentages_val)
-        test_dataset = CustomDataset(root_dir=args.root, data_type='test', transform=transform, load_fake=False, noise_generator=noise_generator, noise_name=noise_name,noise_percentages=noise_percentages_test)
+        train_dataset = CustomDataset(root_dir=args.root, data_type='target_test', transform=transform, load_fake=False, noise_generator=noise_generator, noise_name=noise_name,noise_percentages=noise_percentages_train)
+        val_dataset = CustomDataset(root_dir=args.root, data_type='target_train', transform=transform, load_fake=False, noise_generator=noise_generator, noise_name=noise_name,noise_percentages=noise_percentages_val)
+        #test_dataset = CustomDataset(root_dir=args.root, data_type='test', transform=transform, load_fake=False, noise_generator=noise_generator, noise_name=noise_name,noise_percentages=noise_percentages_test)
 
         train_datasets_with_noises.append(train_dataset)
         val_datasets_with_noises.append(val_dataset)
-        test_datasets_with_noises.append(test_dataset)
+        #test_datasets_with_noises.append(test_dataset)
 
         
     print('Start To process for Train Dataset')
@@ -342,7 +347,7 @@ if __name__ == '__main__':
     for val_dataset in val_datasets_with_noises:
         val_dataset.generate_noise_image(args.workers)
 
-    print('Start To process for Test Dataset')
+"""    print('Start To process for Test Dataset')
     for test_dataset in test_datasets_with_noises:
         test_dataset.generate_noise_image(args.workers)
-
+"""
